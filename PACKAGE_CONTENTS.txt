@@ -1,0 +1,9 @@
+GMK Movement Mapper v17
+
+Program\GMKMovementMapper.exe   Self-contained Windows x64 application
+Source\GMKMovementMapper\       Complete clean-room source project
+README.md                        Setup, build and usage guide
+RESEARCH.md                      Original-repository findings and applied lessons
+
+The package does not contain saved profiles, device instance IDs, user paths,
+debug symbols, build caches, or the supplied original GMK installer/archive.
