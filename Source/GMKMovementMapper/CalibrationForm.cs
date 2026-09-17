@@ -49,7 +49,7 @@ public sealed class CalibrationForm : Form
         try
         {
             using var source = new GmkUsbSource();
-            source.Connect();
+            source.Connect(_profile.ForcedControllerSlot);
             if (_stage == 0)
             {
                 var values = await SampleAsync(source, 2000, false);

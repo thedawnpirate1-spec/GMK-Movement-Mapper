@@ -1,4 +1,5 @@
 using GMKMovementMapper.Controls;
+using GMKMovementMapper.Diagnostics;
 using GMKMovementMapper.HidHide;
 using GMKMovementMapper.Input;
 using GMKMovementMapper.Mapping;
@@ -58,6 +59,12 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _antiDeadzone = new();
     private readonly NumericUpDown _outerDeadzone = new();
     private readonly ComboBox _controllerAButton = new();
+    private readonly ComboBox _controllerSlotPicker = new();
+    private readonly Button _refreshSlotsButton = new();
+    private readonly Label _controllerSlotStatus = new();
+    private readonly Button _openLogButton = new();
+    private readonly LinkLabel _updateLink = new();
+    private bool _suppressSlotEvent;
     private readonly CheckBox _openWithWindows = new();
     private readonly CheckBox _autoStartMovement = new();
     private readonly CheckBox _lowLatencyMode = new();
@@ -138,6 +145,7 @@ public sealed class MainForm : Form
             TitleBarTheme.Apply(this, _profile.Appearance != AppearanceMode.Light);
             if (!_profile.SetupComplete) OpenSetupWizard();
             else if (_appSettings.AutoStartMovement) _ = AutoStartWithRetryAsync();
+            CheckForUpdateInBackground();
         };
         RefreshBindingButtons();
         SetRunningState(false);
@@ -245,6 +253,20 @@ public sealed class MainForm : Form
         _controllerAButton.DataSource = Enum.GetValues<ControllerButtonMapping>();
         _controllerAButton.SelectedItem = _profile.ControllerAButton;
         _controllerAButton.SelectedIndexChanged += (_, _) => { if (_controllerAButton.SelectedItem is ControllerButtonMapping value) { _profile.ControllerAButton = value; _profileStore.Save(_profile); } };
+        _controllerSlotPicker.DropDownStyle = ComboBoxStyle.DropDownList; _controllerSlotPicker.Width = 220;
+        _controllerSlotPicker.SelectedIndexChanged += (_, _) =>
+        {
+            if (_suppressSlotEvent) return;
+            _profile.ForcedControllerSlot = _controllerSlotPicker.SelectedIndex - 1; // -1 = Automatic (index 0)
+            _profileStore.Save(_profile);
+        };
+        StyleSecondaryButton(_refreshSlotsButton, "Refresh");
+        _refreshSlotsButton.Size = new Size(86, 30);
+        _refreshSlotsButton.Click += (_, _) => RefreshControllerSlotPicker();
+        StyleStatusLabel(_controllerSlotStatus, "Only needed if another Xbox/XInput controller is plugged in at the same time as the GMK.");
+        _toolTip.SetToolTip(_controllerSlotPicker, "Which controller slot to read the GMK from, if it shows up in Xbox-compatible mode. Leave on Automatic unless you also use a real Xbox/XInput controller at the same time.");
+        RefreshControllerSlotPicker();
+        StyleSecondaryButton(_openLogButton, "Open log file"); _openLogButton.Size = new Size(115, 36); _openLogButton.Click += (_, _) => OpenLogFile();
         _linearResponse.Text = "Linear stick response"; _linearResponse.AutoSize = true; _linearResponse.Checked = _profile.ControllerLinearResponse;
         _linearResponse.CheckedChanged += (_, _) => { _profile.ControllerLinearResponse = _linearResponse.Checked; _profileStore.Save(_profile); };
 
@@ -354,6 +376,93 @@ public sealed class MainForm : Form
         control.MouseLeave += (_, _) => _visualizer.SetEmphasis(null);
     }
 
+    /// <summary>
+    /// Lists Automatic plus every XInput slot (0-3) with its live connection
+    /// state, so the user can pick exactly which controller is the GMK when
+    /// more than one Xbox-compatible device is plugged in at once.
+    /// The native XInput query runs on a background thread and never blocks
+    /// the UI — a flaky controller can make XInputGetState take a while (or
+    /// never return), and that must not freeze the whole window.
+    /// </summary>
+    private void RefreshControllerSlotPicker()
+    {
+        _suppressSlotEvent = true;
+        _controllerSlotPicker.Items.Clear();
+        _controllerSlotPicker.Items.Add("Automatic (recommended)");
+        for (var i = 0; i < 4; i++) _controllerSlotPicker.Items.Add($"Slot {i} — checking…");
+        _controllerSlotPicker.SelectedIndex = Math.Clamp(_profile.ForcedControllerSlot + 1, 0, _controllerSlotPicker.Items.Count - 1);
+        _suppressSlotEvent = false;
+
+        Task.Run(() => XInputSource.GetSlotStatus()).ContinueWith(task =>
+        {
+            if (!task.IsCompletedSuccessfully || IsDisposed) return;
+            var status = task.Result;
+            BeginInvoke((Action)(() =>
+            {
+                _suppressSlotEvent = true;
+                var current = _controllerSlotPicker.SelectedIndex;
+                _controllerSlotPicker.Items.Clear();
+                _controllerSlotPicker.Items.Add("Automatic (recommended)");
+                for (var i = 0; i < status.Count; i++)
+                    _controllerSlotPicker.Items.Add($"Slot {i} — {(status[i] ? "connected" : "not connected")}");
+                _controllerSlotPicker.SelectedIndex = Math.Clamp(current, 0, _controllerSlotPicker.Items.Count - 1);
+                _suppressSlotEvent = false;
+
+                var connectedCount = status.Count(c => c);
+                _controllerSlotStatus.Text = connectedCount <= 1
+                    ? "Only needed if another Xbox/XInput controller is plugged in at the same time as the GMK."
+                    : $"{connectedCount} Xbox-compatible controllers detected right now — pick the GMK's slot below if Automatic grabs the wrong one.";
+            }));
+        });
+    }
+
+    /// <summary>
+    /// Fire-and-forget: checks GitHub for a newer release and shows a small
+    /// clickable link in the header if one exists. Never shows an error and
+    /// never delays startup — a failed or slow network check must be invisible.
+    /// </summary>
+    private void CheckForUpdateInBackground()
+    {
+        UpdateChecker.CheckForNewerReleaseAsync().ContinueWith(task =>
+        {
+            if (!task.IsCompletedSuccessfully || task.Result is null || IsDisposed) return;
+            var (tag, _) = task.Result.Value;
+            BeginInvoke((Action)(() =>
+            {
+                _updateLink.Text = $"Update available: {tag} →";
+                _updateLink.Links.Clear();
+                _updateLink.Links.Add(0, _updateLink.Text.Length);
+                _updateLink.LinkClicked += (_, _) => OpenReleasesPage();
+                _updateLink.Visible = true;
+                Logger.Info($"Update available: {tag} (running {UpdateChecker.CurrentVersion})");
+            }));
+        });
+    }
+
+    private static void OpenReleasesPage()
+    {
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/thedawnpirate1-spec/GMK-Movement-Mapper/releases") { UseShellExecute = true }); }
+        catch { /* opening the browser is best-effort */ }
+    }
+
+    private void OpenLogFile()
+    {
+        try
+        {
+            var path = Logger.CurrentLogPath;
+            if (!File.Exists(path))
+            {
+                MessageBox.Show(this, "No log entries yet today. The log file is created the first time something worth recording happens (a connection, an error).", "No log file yet", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Could not open log file", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private Control BuildPage()
     {
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = PageColor, ColumnCount = 1, RowCount = 2, Tag = "page" };
@@ -384,11 +493,13 @@ public sealed class MainForm : Form
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
         var logo = new BrandLogo { Dock = DockStyle.Fill, Margin = new Padding(0,0,8,0) };
-        var textStack = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, BackColor = Color.Transparent, Margin = new Padding(0) };
-        textStack.RowStyles.Add(new RowStyle(SizeType.Percent, 60)); textStack.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
+        var textStack = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, BackColor = Color.Transparent, Margin = new Padding(0) };
+        textStack.RowStyles.Add(new RowStyle(SizeType.Percent, 45)); textStack.RowStyles.Add(new RowStyle(SizeType.Percent, 30)); textStack.RowStyles.Add(new RowStyle(SizeType.Percent, 25));
         var title = new Label { Text = "GMK Mapper", Dock = DockStyle.Fill, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 16F, FontStyle.Bold), TextAlign = ContentAlignment.BottomLeft, Tag = "header" };
-        _subtitle = new Label { Text = "GMK to Keyboard Movement", Dock = DockStyle.Fill, ForeColor = Color.FromArgb(174,187,207), Font = new Font("Segoe UI", 8.7F), TextAlign = ContentAlignment.TopLeft, Tag = "header" };
-        textStack.Controls.Add(title,0,0); textStack.Controls.Add(_subtitle,0,1);
+        _subtitle = new Label { Text = $"GMK to Keyboard Movement · v{UpdateChecker.CurrentVersion.ToString(3)}", Dock = DockStyle.Fill, ForeColor = Color.FromArgb(174,187,207), Font = new Font("Segoe UI", 8.7F), TextAlign = ContentAlignment.TopLeft, Tag = "header" };
+        _updateLink.Dock = DockStyle.Fill; _updateLink.AutoSize = false; _updateLink.Visible = false;
+        _updateLink.Font = new Font("Segoe UI Semibold", 8.3F, FontStyle.Bold); _updateLink.LinkColor = Color.FromArgb(147,197,253); _updateLink.Tag = "header";
+        textStack.Controls.Add(title,0,0); textStack.Controls.Add(_subtitle,0,1); textStack.Controls.Add(_updateLink,0,2);
         _darkButton.Anchor = AnchorStyles.None; _runBadge.Anchor = AnchorStyles.None;
         header.Controls.Add(logo,0,0); header.Controls.Add(textStack,1,0); header.Controls.Add(_darkButton,2,0); header.Controls.Add(_runBadge,3,0);
         return header;
@@ -447,8 +558,8 @@ public sealed class MainForm : Form
     private TabPage BuildSetupTab()
     {
         var page = new TabPage("Setup & startup") { Padding = new Padding(14), Tag = "card" };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 10 };
-        for (var i = 0; i < 10; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 13 };
+        for (var i = 0; i < 13; i++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.Controls.Add(SectionTitle("Profile"), 0, 0);
         var profileRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false, Margin = new Padding(0, 2, 0, 10) };
         profileRow.Controls.AddRange([_profilePicker, _newProfileButton, _deleteProfileButton]);
@@ -460,10 +571,15 @@ public sealed class MainForm : Form
         var setupRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, MinimumSize = new Size(0, 44), WrapContents = false, Margin = new Padding(0, 4, 0, 4), Padding = new Padding(0, 2, 0, 2) };
         setupRow.Controls.AddRange([_wizardButton, _setupButton, _helpButton]);
         layout.Controls.Add(setupRow, 0, 5); layout.Controls.Add(_deviceStatus, 0, 6);
-        layout.Controls.Add(SectionTitle("Automatic startup"), 0, 7);
+        layout.Controls.Add(SectionTitle("GMK controller slot (Xbox-compatible mode)"), 0, 7);
+        var slotRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false, Margin = new Padding(0, 2, 0, 2) };
+        slotRow.Controls.AddRange([_controllerSlotPicker, _refreshSlotsButton]);
+        layout.Controls.Add(slotRow, 0, 8);
+        layout.Controls.Add(_controllerSlotStatus, 0, 9);
+        layout.Controls.Add(SectionTitle("Automatic startup"), 0, 10);
         var startup = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = new Padding(0, 4, 0, 8) };
-        startup.Controls.Add(_openWithWindows); startup.Controls.Add(_autoStartMovement); startup.Controls.Add(_lowLatencyMode); layout.Controls.Add(startup, 0, 8);
-        layout.Controls.Add(new Label { Text = "Automatic movement uses the selected profile. Controller mode creates the virtual controller only after movement starts.", AutoSize = true, MaximumSize = new Size(450, 0), Tag = "muted" }, 0, 9);
+        startup.Controls.Add(_openWithWindows); startup.Controls.Add(_autoStartMovement); startup.Controls.Add(_lowLatencyMode); layout.Controls.Add(startup, 0, 11);
+        layout.Controls.Add(new Label { Text = "Automatic movement uses the selected profile. Controller mode creates the virtual controller only after movement starts.", AutoSize = true, MaximumSize = new Size(450, 0), Tag = "muted" }, 0, 12);
         page.Controls.Add(layout); return page;
     }
 
@@ -501,7 +617,7 @@ public sealed class MainForm : Form
         AddDiagnosticRow(layout, "USB read rate", _diagRate, 5); AddDiagnosticRow(layout, "Input processing latency", _diagLatency, 6);
         AddDiagnosticRow(layout, "Calibration health", _diagCalibration, 7); AddDiagnosticRow(layout, "Active profile", _diagProfile, 8);
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
-        actions.Controls.Add(_refreshDiagnosticsButton); actions.Controls.Add(_troubleshootButton); layout.Controls.Add(actions, 1, 9);
+        actions.Controls.Add(_refreshDiagnosticsButton); actions.Controls.Add(_troubleshootButton); actions.Controls.Add(_openLogButton); layout.Controls.Add(actions, 1, 9);
         page.Controls.Add(layout); RefreshDiagnostics(); return page;
     }
 
@@ -641,9 +757,10 @@ public sealed class MainForm : Form
             if (!quiet) MessageBox.Show(this, string.Join("\n", validation.Select(x => "• " + x)), "Check configuration", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
-        try { _joystick.Connect(); }
+        try { _joystick.Connect(_profile.ForcedControllerSlot); Logger.Info($"GMK connected: {_joystick.DeviceName}"); }
         catch (Exception ex)
         {
+            Logger.Warn($"Connect failed: {ex.Message}");
             SetConnectionState("GMK not connected — reconnect it and close other GMK software", false, true);
             if (!quiet) MessageBox.Show(this, ex.Message, "Could not open GMK", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
@@ -697,7 +814,7 @@ public sealed class MainForm : Form
                         {
                             try
                             {
-                                _joystick.Dispose(); _joystick.Connect();
+                                _joystick.Dispose(); _joystick.Connect(_profile.ForcedControllerSlot);
                                 lastSuccessfulRead = Environment.TickCount64; disconnectShown = false;
                                 BeginInvoke((Action)(() => SetConnectionState("GMK reconnected automatically", true, false)));
                             }

@@ -69,6 +69,13 @@ public sealed class MovementProfile
     public int JoystickIndex { get; set; } = 0;
     public string? GmkInstanceId { get; set; }
 
+    // Which XInput slot (0-3) to read when the GMK's native USB interface is not
+    // found and the device must be read as an Xbox-compatible fallback controller.
+    // -1 means automatic: use whichever slot is connected first. A specific slot
+    // is only needed when another real Xbox/XInput controller is connected at the
+    // same time as the GMK, so auto-detection would otherwise be ambiguous.
+    public int ForcedControllerSlot { get; set; } = -1;
+
     public static string DefaultPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "GMKRebuild",
@@ -121,6 +128,7 @@ public sealed class MovementProfile
         ControllerAntiDeadzone = FiniteClamp(ControllerAntiDeadzone, 0, 0.95, 0);
         if (!Enum.IsDefined(Appearance)) Appearance = DarkMode ? AppearanceMode.Dark : AppearanceMode.Light;
         JoystickIndex = Math.Max(0, JoystickIndex);
+        ForcedControllerSlot = Math.Clamp(ForcedControllerSlot, -1, 3);
     }
 
     private static double FiniteClamp(double value, double min, double max, double fallback)
